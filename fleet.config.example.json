@@ -1,0 +1,26 @@
+{
+  "owner_name": "My Fleet",
+  "hub_port": 7778,
+  "cloud_vm": {
+    "enabled": false,
+    "id": "vm-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "name": "cloud-dev",
+    "forward_port": 7777
+  },
+  "machines": [
+    {
+      "id": "local-mac",
+      "name": "Primary Mac",
+      "mode": "local",
+      "chip": "Apple Silicon",
+      "ram_gb": 32.0,
+      "ip": "127.0.0.1"
+    }
+  ],
+  "endpoints": [
+    {
+      "name": "Local Hub",
+      "url": "http://127.0.0.1:7778"
+    }
+  ]
+}
