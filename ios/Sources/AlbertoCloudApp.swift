@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import UIKit
+import Security
 
 @main
 struct AlbertoCloudApp: App {
@@ -125,19 +126,166 @@ enum CockpitTab: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - Permissive TLS Delegate
+// MARK: - Strict TLS Evaluation
 
-final class PermissiveTLSDelegate: NSObject, URLSessionDelegate {
+enum TLSTrustEvaluator {
+    static func isLoopbackHost(_ host: String) -> Bool {
+        let lower = host.lowercased()
+        return lower == "127.0.0.1" || lower == "localhost" || lower == "::1" || lower == "[::1]"
+    }
+
+    static func evaluate(
+        challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        let host = challenge.protectionSpace.host
+        if host.isEmpty {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        var cfError: CFError?
+        if SecTrustEvaluateWithError(trust, &cfError) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        #if DEBUG
+        if isLoopbackHost(host) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        #endif
+        completionHandler(.cancelAuthenticationChallenge, nil)
+    }
+}
+
+enum KeychainTokenStore {
+    private static let service = "ai.burnbar.alberto-cloud.mission-control"
+    private static let account = "bearer-token"
+    static let primaryOrigin = "https://albertos-mac-studio.tailbf4ff5.ts.net:8443"
+
+    static func originKey(for url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "https" || scheme == "http"),
+              let host = url.host?.lowercased(),
+              !host.isEmpty else {
+            return nil
+        }
+        let defaultPort = (scheme == "https") ? 443 : 80
+        let port = url.port ?? defaultPort
+        return port == defaultPort ? "\(scheme)://\(host)" : "\(scheme)://\(host):\(port)"
+    }
+
+    static func configuredPrimaryOriginKey() -> String {
+        if let raw = ProcessInfo.processInfo.environment["MISSION_CONTROL_ORIGIN"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let url = URL(string: raw),
+           let key = originKey(for: url) {
+            return key
+        }
+        return primaryOrigin
+    }
+
+    static func isPinnedPrimaryOrigin(_ url: URL) -> Bool {
+        guard let key = originKey(for: url) else { return false }
+        return key == configuredPrimaryOriginKey()
+    }
+
+    private static func loadAccount(_ accountName: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: accountName,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !str.isEmpty else {
+            return nil
+        }
+        return str
+    }
+
+    static func loadToken(for url: URL? = nil) -> String? {
+        if let url, let key = originKey(for: url) {
+            if let scoped = loadAccount("\(account):\(key)") {
+                return scoped
+            }
+            guard isPinnedPrimaryOrigin(url) else {
+                return nil
+            }
+        }
+        return loadAccount(account)
+    }
+
+    @discardableResult
+    static func saveToken(_ token: String, for url: URL) -> Bool {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let key = originKey(for: url), let data = trimmed.data(using: .utf8) else {
+            return false
+        }
+        let accountName = "\(account):\(key)"
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: accountName
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: accountName,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecValueData as String: data
+        ]
+        return SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess
+    }
+}
+
+final class StrictTLSDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        if let trust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        } else {
-            completionHandler(.performDefaultHandling, nil)
+        TLSTrustEvaluator.evaluate(challenge: challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
+enum FittedImageGeometry {
+    static func normalizedPoint(location: CGPoint, in containerSize: CGSize, imageSize: CGSize) -> CGPoint? {
+        guard containerSize.width > 0, containerSize.height > 0,
+              imageSize.width > 0, imageSize.height > 0 else {
+            return nil
         }
+        let scale = min(containerSize.width / imageSize.width, containerSize.height / imageSize.height)
+        let fittedWidth = imageSize.width * scale
+        let fittedHeight = imageSize.height * scale
+        let originX = (containerSize.width - fittedWidth) * 0.5
+        let originY = (containerSize.height - fittedHeight) * 0.5
+        let relX = (location.x - originX) / max(1.0, fittedWidth)
+        let relY = (location.y - originY) / max(1.0, fittedHeight)
+        guard relX >= 0.0, relX <= 1.0, relY >= 0.0, relY <= 1.0 else {
+            return nil
+        }
+        return CGPoint(x: min(1.0, max(0.0, relX)), y: min(1.0, max(0.0, relY)))
     }
 }
 
@@ -240,20 +388,19 @@ final class CloudStudioViewModel: ObservableObject {
     @Published var activeTab: CockpitTab = .studio
     @Published var isLaunchpadExpanded: Bool = false
     @Published var screenImage: UIImage?
-    @Published var routeName: String = "LAN Direct"
+    @Published var routeName: String = "Tailscale TLS"
     @Published var latencyMs: Int = 9
     @Published var isConnected: Bool = false
     @Published var isRunningCommand: Bool = false
     @Published var toastMessage: String?
     @Published var useInteractiveWebVNC: Bool = false
     @Published var clickMode: MonitorClickMode = .single
-    @Published var activeEndpoint: String = "http://192.168.1.126:7778"
+    @Published var activeEndpoint: String = KeychainTokenStore.primaryOrigin
 
     let endpoints: [(name: String, url: String)] = [
-        ("LAN Direct", "http://192.168.1.126:7778"),
-        ("Tailscale TLS", "https://albertos-mac-studio.tailbf4ff5.ts.net:8443"),
-        ("Tailscale IP", "http://100.94.33.26:7778"),
-        ("Cloud Edge", "https://lofty-indigo-meerkat--alberto-s-team--7777.cmux.sh")
+        ("Tailscale TLS", KeychainTokenStore.primaryOrigin),
+        ("Cloud Edge", "https://lofty-indigo-meerkat--alberto-s-team--7777.cmux.sh"),
+        ("Tailscale IP TLS", "https://100.94.33.26:8443")
     ]
 
     var currentMachine: FleetMachine {
@@ -261,44 +408,89 @@ final class CloudStudioViewModel: ObservableObject {
     }
 
     private let session: URLSession
-    private var started = false
+    private var fleetPollTask: Task<Void, Never>?
+    private var screenshotPollTask: Task<Void, Never>?
+    private var routeProbeInFlight = false
+    private var screenshotFetchInFlight = false
+    private var inFlightCommandCount = 0
 
     init() {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 4.5
         cfg.timeoutIntervalForResource = 12.0
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: cfg, delegate: PermissiveTLSDelegate(), delegateQueue: nil)
+        self.session = URLSession(configuration: cfg, delegate: StrictTLSDelegate(), delegateQueue: nil)
+    }
+
+    func resolveAuthToken(for url: URL) -> String? {
+        if let keychainToken = KeychainTokenStore.loadToken(for: url) {
+            return keychainToken
+        }
+        guard KeychainTokenStore.isPinnedPrimaryOrigin(url) else {
+            return nil
+        }
+        if let envToken = ProcessInfo.processInfo.environment["MISSION_CONTROL_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envToken.isEmpty {
+            return envToken
+        }
+        return nil
+    }
+
+    private func authorizedRequest(url: URL, method: String = "GET", jsonBody: [String: Any]? = nil) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        if let token = resolveAuthToken(for: url) {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let jsonBody {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: jsonBody)
+        }
+        return req
     }
 
     func start() {
-        guard !started else { return }
-        started = true
+        guard fleetPollTask == nil else { return }
 
-        Task {
-            await selectFastestRoute()
+        fleetPollTask = Task { [weak self] in
+            guard let self else { return }
+            await self.selectFastestRoute()
             while !Task.isCancelled {
-                await refreshFleet()
+                await self.refreshFleet()
                 try? await Task.sleep(nanoseconds: 2_600_000_000)
             }
         }
 
-        Task {
+        screenshotPollTask = Task { [weak self] in
+            guard let self else { return }
             while !Task.isCancelled {
-                if selectedMachineID == "alberto-dev" && !useInteractiveWebVNC && activeTab == .studio {
-                    await refreshScreenshot()
+                if self.selectedMachineID == "alberto-dev" && !self.useInteractiveWebVNC && self.activeTab == .studio {
+                    await self.refreshScreenshot()
                 }
                 try? await Task.sleep(nanoseconds: 600_000_000)
             }
         }
     }
 
+    func stop() {
+        fleetPollTask?.cancel()
+        fleetPollTask = nil
+        screenshotPollTask?.cancel()
+        screenshotPollTask = nil
+    }
+
     func selectFastestRoute() async {
+        guard !routeProbeInFlight else { return }
+        routeProbeInFlight = true
+        defer { routeProbeInFlight = false }
+
         for ep in endpoints {
-            guard let url = URL(string: "\(ep.url)/api/fleet") else { continue }
+            guard let url = URL(string: "\(ep.url)/api/fleet"),
+                  resolveAuthToken(for: url) != nil else { continue }
             let t0 = DispatchTime.now()
             do {
-                let (data, resp) = try await session.data(from: url)
+                let req = authorizedRequest(url: url)
+                let (data, resp) = try await session.data(for: req)
                 if let http = resp as? HTTPURLResponse, http.statusCode == 200,
                    let decoded = try? JSONDecoder().decode(FleetResponse.self, from: data),
                    !decoded.machines.isEmpty {
@@ -316,13 +508,15 @@ final class CloudStudioViewModel: ObservableObject {
                 continue
             }
         }
+        self.isConnected = false
     }
 
     func refreshFleet() async {
         guard let url = URL(string: "\(activeEndpoint)/api/fleet") else { return }
         let t0 = DispatchTime.now()
         do {
-            let (data, resp) = try await session.data(from: url)
+            let req = authorizedRequest(url: url)
+            let (data, resp) = try await session.data(for: req)
             if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
                 let decoded = try JSONDecoder().decode(FleetResponse.self, from: data)
                 if !decoded.machines.isEmpty {
@@ -334,17 +528,25 @@ final class CloudStudioViewModel: ObservableObject {
                 }
                 return
             }
+            self.isConnected = false
+            await selectFastestRoute()
         } catch {
+            self.isConnected = false
             await selectFastestRoute()
         }
     }
 
     func refreshScreenshot() async {
+        guard !screenshotFetchInFlight else { return }
+        screenshotFetchInFlight = true
+        defer { screenshotFetchInFlight = false }
         let ts = Int(Date().timeIntervalSince1970 * 1000)
         guard let url = URL(string: "\(activeEndpoint)/api/screenshot?t=\(ts)") else { return }
         do {
-            let (data, resp) = try await session.data(from: url)
+            let req = authorizedRequest(url: url)
+            let (data, resp) = try await session.data(for: req)
             if let http = resp as? HTTPURLResponse, http.statusCode == 200,
+               data.count <= 12 * 1024 * 1024,
                let img = UIImage(data: data) {
                 self.screenImage = img
                 self.isConnected = true
@@ -355,20 +557,29 @@ final class CloudStudioViewModel: ObservableObject {
     func runCommandOnSelectedMachine(_ cmd: String, targetOverride: String? = nil, action: String = "") {
         let target = targetOverride ?? selectedMachineID
         UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        inFlightCommandCount += 1
         isRunningCommand = true
         Task {
-            defer { isRunningCommand = false }
+            defer {
+                inFlightCommandCount = max(0, inFlightCommandCount - 1)
+                isRunningCommand = inFlightCommandCount > 0
+            }
             guard let url = URL(string: "\(activeEndpoint)/api/fleet/exec") else { return }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "machine": target,
-                "cmd": cmd,
-                "action": action
-            ])
+            let req = authorizedRequest(
+                url: url,
+                method: "POST",
+                jsonBody: [
+                    "machine": target,
+                    "cmd": cmd,
+                    "action": action
+                ]
+            )
             do {
-                let (data, _) = try await session.data(for: req)
+                let (data, resp) = try await session.data(for: req)
+                guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    presentToast("Command rejected by host")
+                    return
+                }
                 if let res = try? JSONDecoder().decode(ExecResponse.self, from: data) {
                     presentToast(res.message ?? "Executed on \(target)")
                 } else {
@@ -390,12 +601,17 @@ final class CloudStudioViewModel: ObservableObject {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         Task {
             guard let url = URL(string: "\(activeEndpoint)/api/action") else { return }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: ["action": action, "arg": arg])
+            let req = authorizedRequest(
+                url: url,
+                method: "POST",
+                jsonBody: ["action": action, "arg": arg]
+            )
             do {
-                let (data, _) = try await session.data(for: req)
+                let (data, resp) = try await session.data(for: req)
+                guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    presentToast("Action rejected by host")
+                    return
+                }
                 if let res = try? JSONDecoder().decode(ActionResponse.self, from: data),
                    let msg = res.message {
                     presentToast(msg)
@@ -643,6 +859,9 @@ struct LiquidGlassStudioView: View {
         }
         .onAppear {
             vm.start()
+        }
+        .onDisappear {
+            vm.stop()
         }
         .fullScreenCover(isPresented: $showFullscreenMonitor) {
             FullscreenGlassDisplaySheet(vm: vm)
@@ -1089,10 +1308,13 @@ struct LiquidGlassStudioView: View {
                                     .gesture(
                                         DragGesture(minimumDistance: 0)
                                             .onEnded { value in
-                                                let nx = max(0, min(1, value.location.x / max(1, geo.size.width)))
-                                                let ny = max(0, min(1, value.location.y / max(1, geo.size.height)))
+                                                guard let norm = FittedImageGeometry.normalizedPoint(
+                                                    location: value.location,
+                                                    in: geo.size,
+                                                    imageSize: img.size
+                                                ) else { return }
                                                 animateTapRipple(at: value.location)
-                                                vm.triggerX11Action(vm.clickMode.actionName, arg: String(format: "%.4f,%.4f", nx, ny))
+                                                vm.triggerX11Action(vm.clickMode.actionName, arg: String(format: "%.4f,%.4f", norm.x, norm.y))
                                             }
                                     )
 
@@ -1531,9 +1753,13 @@ struct FullscreenGlassDisplaySheet: View {
                             .gesture(
                                 SpatialTapGesture()
                                     .onEnded { event in
-                                        let nx = max(0, min(1, event.location.x / max(1, geo.size.width * zoom)))
-                                        let ny = max(0, min(1, event.location.y / max(1, geo.size.height * zoom)))
-                                        vm.triggerX11Action(vm.clickMode.actionName, arg: String(format: "%.4f,%.4f", nx, ny))
+                                        let frameSize = CGSize(width: geo.size.width * zoom, height: geo.size.height * zoom)
+                                        guard let norm = FittedImageGeometry.normalizedPoint(
+                                            location: event.location,
+                                            in: frameSize,
+                                            imageSize: img.size
+                                        ) else { return }
+                                        vm.triggerX11Action(vm.clickMode.actionName, arg: String(format: "%.4f,%.4f", norm.x, norm.y))
                                     }
                             )
                     }
@@ -1594,6 +1820,15 @@ struct FullscreenGlassDisplaySheet: View {
 
 struct WebViewContainer: UIViewRepresentable {
     let url: URL
+    var authToken: String? = nil
+
+    private func makeAuthorizedRequest(for targetURL: URL) -> URLRequest {
+        var req = URLRequest(url: targetURL)
+        if let token = authToken ?? KeychainTokenStore.loadToken(for: targetURL), !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return req
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1602,36 +1837,71 @@ struct WebViewContainer: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.isOpaque = false
         webView.backgroundColor = .black
         webView.scrollView.backgroundColor = .black
-        webView.load(URLRequest(url: url))
         context.coordinator.lastURL = url
+        webView.load(makeAuthorizedRequest(for: url))
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         if context.coordinator.lastURL != url {
             context.coordinator.lastURL = url
-            webView.load(URLRequest(url: url))
+            webView.load(makeAuthorizedRequest(for: url))
         }
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         var lastURL: URL?
 
+        private static func effectivePort(for url: URL) -> Int? {
+            if let port = url.port { return port }
+            switch url.scheme?.lowercased() {
+            case "https": return 443
+            case "http": return 80
+            default: return nil
+            }
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let targetURL = navigationAction.request.url,
+                  let expectedURL = lastURL,
+                  let expectedHost = expectedURL.host?.lowercased(),
+                  let targetHost = targetURL.host?.lowercased(),
+                  targetHost == expectedHost,
+                  targetURL.scheme?.lowercased() == expectedURL.scheme?.lowercased(),
+                  Self.effectivePort(for: targetURL) == Self.effectivePort(for: expectedURL) else {
+                decisionHandler(.cancel)
+                return
+            }
+            let scheme = targetURL.scheme?.lowercased() ?? ""
+            if scheme == "https" {
+                decisionHandler(.allow)
+                return
+            }
+            #if DEBUG
+            if scheme == "http" && TLSTrustEvaluator.isLoopbackHost(targetHost) {
+                decisionHandler(.allow)
+                return
+            }
+            #endif
+            decisionHandler(.cancel)
+        }
+
         func webView(
             _ webView: WKWebView,
             didReceive challenge: URLAuthenticationChallenge,
             completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
         ) {
-            if let trust = challenge.protectionSpace.serverTrust {
-                completionHandler(.useCredential, URLCredential(trust: trust))
-            } else {
-                completionHandler(.performDefaultHandling, nil)
-            }
+            TLSTrustEvaluator.evaluate(challenge: challenge, completionHandler: completionHandler)
         }
     }
 }
